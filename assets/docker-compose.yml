@@ -1,0 +1,200 @@
+# Single-host deployment for the withvibe stack.
+#   - postgres: data store
+#   - api:      NestJS, drives Docker via DooD (host socket mounted in)
+#   - web:      Next.js standalone server, proxies auth routes to api over the
+#               compose network
+#
+# Two ways to run this:
+#
+# A) From source (this repo):
+#      cp .env.example .env  &&  edit secrets
+#      docker compose up -d --build
+#
+# B) From a prebuilt bundle (no source on the target host):
+#      ./scripts/build-bundle.sh        # locally, produces dist/withvibe-deploy.tar.gz
+#      scp dist/withvibe-deploy.tar.gz user@host:~ && ssh user@host
+#      tar -xzf withvibe-deploy.tar.gz && cd withvibe-deploy-*
+#      docker load -i images.tar
+#      cp .env.example .env  &&  edit secrets
+#      docker compose up -d
+#
+# Production posture: bring-your-own reverse proxy / TLS in front of :3000.
+
+name: withvibe
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-withvibe}
+      # Required — no weak default. `docker compose up` fails fast if unset
+      # so an install can never silently come up on a guessable password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — set a strong value in .env (e.g. openssl rand -hex 24)}
+      POSTGRES_DB: ${POSTGRES_DB:-withvibe}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-withvibe} -d ${POSTGRES_DB:-withvibe}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [withvibe]
+
+  api:
+    image: withvibe/api:${WITHVIBE_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    # Cap log file size so the api's per-request JSON access log can't fill
+    # the disk on a long-running deploy. With max-size 50m × 5 rotated files
+    # each container is bounded to ~250M of logs on disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-withvibe}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-withvibe}
+      # Signs every session + bridge/MCP/WS token. Required, no default —
+      # the api ALSO refuses to boot in production on a weak/placeholder
+      # value (see common/startup-secrets.ts). Generate: openssl rand -hex 32
+      INTERNAL_JWT_SECRET: "${INTERNAL_JWT_SECRET:?INTERNAL_JWT_SECRET is required - generate with openssl rand -hex 32}"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
+      API_PUBLIC_URL: ${API_PUBLIC_URL:-http://localhost:4000}
+      PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
+      # Wildcard base domain for subdomain-routed env services + demo
+      # templates. Empty ⇒ the api falls back to its built-in default.
+      # The CLI sets this to the Traefik base domain at install time.
+      WITHVIBE_ROUTING_BASE_DOMAIN: ${WITHVIBE_ROUTING_BASE_DOMAIN:-}
+      # Name of the external Docker network Traefik is attached to. The
+      # subdomain rewriter joins each exposed env service to this network
+      # and points Traefik labels at it. Must match the network's `name:`
+      # on the host. Defaults to the platform's own `withvibe` network when
+      # operators colocate Traefik there; set explicitly otherwise.
+      PROXY_NETWORK: ${PROXY_NETWORK:-withvibe}
+      # Traefik entrypoint name the env's router binds to (must match
+      # Traefik's static config — `websecure` is the platform default :443
+      # entrypoint).
+      TRAEFIK_ENTRYPOINT: ${TRAEFIK_ENTRYPOINT:-websecure}
+      # Traefik certresolver name for issuing TLS certs. Empty string
+      # disables TLS labels (useful when an upstream LB terminates TLS or
+      # for local plain-HTTP dev).
+      TRAEFIK_CERT_RESOLVER: ${TRAEFIK_CERT_RESOLVER:-letsencrypt}
+      # Container name the platform `docker network connect`s to each env's
+      # per-env edge network so Traefik can route it (Phase 2 isolation).
+      # Defaults to the platform Traefik (`withvibe-traefik`); override if
+      # your Traefik runs under a different name.
+      WITHVIBE_TRAEFIK_CONTAINER: ${WITHVIBE_TRAEFIK_CONTAINER:-withvibe-traefik}
+      # --- Cross-env shared infra (Phase 3, OFF by default) --------------
+      # Opt-in only. WITHVIBE_SHARED_NET names a pre-existing Docker network
+      # the operator owns (with their shared DB attached under a stable
+      # name). Services that set `x-use-shared` are connected to it ONLY for
+      # envs the operator allowlists below (by env id, or template id/slug).
+      # Leave WITHVIBE_SHARED_NET empty to keep envs fully isolated.
+      WITHVIBE_SHARED_NET: ${WITHVIBE_SHARED_NET:-}
+      WITHVIBE_SHARED_ENVS: ${WITHVIBE_SHARED_ENVS:-}
+      WITHVIBE_SHARED_TEMPLATES: ${WITHVIBE_SHARED_TEMPLATES:-}
+      # --- External/remote TCP access (Phase 4, OFF by default) ---------
+      # Opt-in only. Set WITHVIBE_TCP_EXPOSE=1 to enable, then allowlist the
+      # env id or template (id/slug). For an authorized env, a service with
+      # `x-expose-tcp: <port>` gets a unique host port published so it's
+      # reachable as <PUBLIC_HOST>:<allocated-port> from another machine.
+      # WITHVIBE_TCP_BIND pins the publish to one interface (e.g. a VPN IP);
+      # empty = all interfaces. Exposing a DB off-box is sensitive — keep
+      # disabled unless you mean it, and prefer a private bind interface.
+      WITHVIBE_TCP_EXPOSE: ${WITHVIBE_TCP_EXPOSE:-}
+      WITHVIBE_TCP_EXPOSE_ENVS: ${WITHVIBE_TCP_EXPOSE_ENVS:-}
+      WITHVIBE_TCP_EXPOSE_TEMPLATES: ${WITHVIBE_TCP_EXPOSE_TEMPLATES:-}
+      WITHVIBE_TCP_BIND: ${WITHVIBE_TCP_BIND:-}
+      REPO_BASE_DIR: ${REPO_BASE_DIR:-/root/.withvibe/repos}
+      # Persisted per-user `code tunnel` auth dirs. Mounted volume below.
+      CODE_TUNNEL_DATA_DIR: /var/lib/withvibe/code-tunnel
+      # Comma-separated extra VS Code extension IDs to preinstall into every
+      # `code tunnel` session (in addition to the always-on anthropic.claude-code).
+      # Operator-configurable via `withvibe configure` → Tunnel customization.
+      CODE_TUNNEL_EXTENSIONS: ${CODE_TUNNEL_EXTENSIONS:-}
+      # Comma-separated apt packages installed in this container at boot
+      # (see docker-entrypoint.sh) so tunnel'd VS Code extensions have their
+      # runtime tooling on PATH (e.g. openjdk-21-jdk-headless for Java).
+      CODE_TUNNEL_APT_PACKAGES: ${CODE_TUNNEL_APT_PACKAGES:-}
+      # Claude Code refuses --dangerously-skip-permissions / Bypass
+      # Permissions mode as root. The api container runs as root (needs
+      # docker.sock), and the `code tunnel` server it spawns hosts the
+      # Claude Code extension, which inherits this env. IS_SANDBOX=1 is
+      # Claude Code's documented escape hatch for sandboxed/containerized
+      # hosts so bypass mode works. Default 1; set IS_SANDBOX=0 only if
+      # you run the api as a non-root user.
+      IS_SANDBOX: ${IS_SANDBOX:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      WITHVIBE_VERSION: ${WITHVIBE_VERSION:-latest}
+      NODE_ENV: production
+      PORT: "4000"
+    ports:
+      # Exposed for DooD-spawned runner sidecars that call back via
+      # host.docker.internal:4000 (CLAUDE_RUNNER_MCP_BASE_URL default). The
+      # host-side port is configurable via API_HOST_PORT so installs on
+      # boxes with :4000 already taken can map to e.g. 4001 transparently.
+      - "${API_HOST_PORT:-4000}:4000"
+    volumes:
+      # DooD: api drives the host docker daemon to spawn env sidecars.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Path-parity bind mount: host and container see clones under the
+      # SAME absolute path, so when api emits `docker run -v <path>:...`
+      # the host daemon finds <path>.
+      - ${REPO_BASE_DIR:-/root/.withvibe/repos}:${REPO_BASE_DIR:-/root/.withvibe/repos}
+      # Persist `code tunnel` per-user auth dirs across redeploys so users
+      # don't have to re-run the device-code login every time.
+      - code-tunnel-data:/var/lib/withvibe/code-tunnel
+      # Persist the Agent SDK chat transcripts (CLAUDE_CONFIG_DIR) so multi-turn
+      # conversation memory survives api redeploys/recreates. The image
+      # pre-creates this dir owned by `claude` so the volume initializes with the
+      # right ownership (see apps/api/Dockerfile).
+      - claude-home:/home/claude/.claude
+    extra_hosts:
+      # So spawned sidecars resolving host.docker.internal hit the host
+      # gateway on Linux too (Docker Desktop wires this automatically on
+      # Mac/Windows; this line is harmless there).
+      - "host.docker.internal:host-gateway"
+    networks: [withvibe]
+
+  web:
+    image: withvibe/web:${WITHVIBE_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    depends_on:
+      - api
+    environment:
+      # Server-side rewrites (next.config.ts) point /api/auth/* and
+      # /api/cli-auth/* at this URL. Inside the compose network the api
+      # service is reachable as `api:4000`.
+      API_BASE_URL: http://api:4000
+      NODE_ENV: production
+      PORT: "3000"
+    ports:
+      - "${WEB_HOST_PORT:-3000}:3000"
+    networks: [withvibe]
+
+volumes:
+  postgres-data:
+  code-tunnel-data:
+  claude-home:
+
+networks:
+  withvibe:
+    name: withvibe
