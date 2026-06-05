@@ -71,6 +71,9 @@ const ENV_KEY_ORDER = [
   "TRAEFIK_HTTPS_HOST_PORT",
   "CODE_TUNNEL_EXTENSIONS",
   "CODE_TUNNEL_APT_PACKAGES",
+  "DEMO_MODE",
+  "NEXT_PUBLIC_DEMO_MODE",
+  "DEMO_TEMPLATE_REPOS",
 ];
 
 const ENV_COMMENTS: Record<string, string> = {
@@ -92,6 +95,10 @@ const ENV_COMMENTS: Record<string, string> = {
     "Extra VS Code extensions to preinstall in every `code tunnel` session, comma-separated marketplace IDs (e.g. vscjava.vscode-java-pack,redhat.java). Claude Code is always installed regardless.",
   CODE_TUNNEL_APT_PACKAGES:
     "Extra apt packages installed in the api container at boot, for tooling the tunnel'd VS Code needs (e.g. openjdk-21-jdk-headless,maven for Java; python3 for Python). Restart the api after editing.",
+  DEMO_MODE:
+    "Public demo mode — leave blank for a normal install. Set DEMO_MODE and NEXT_PUBLIC_DEMO_MODE both to \"true\" to run a locked-down public demo: every visitor gets their own isolated workspace running one cloned vibe-aquarium env, and all other env/template/repo creation is blocked. In demo mode set ANTHROPIC_API_KEY above (visitors can't set their own). Restart the stack after editing.",
+  DEMO_TEMPLATE_REPOS:
+    "Comma-separated GitHub repo URLs auto-seeded as env templates into every new workspace. In demo mode this is the vibe-aquarium repo; leave blank for a normal install.",
 };
 
 // "Default" preset — used by the one-click flow and when -y is passed. Every
@@ -106,6 +113,9 @@ type Defaults = {
   repoBaseDir: string;
   enableQaBrowser: boolean;
   enableCodeServer: boolean;
+  // Public demo mode — OFF by default. Operators opt in (custom preset) to run
+  // a locked-down public demo.
+  demoMode: boolean;
   // Default preset enables Traefik with a localhost base domain. The
   // compose-rewriter detects the localhost shape and emits an HTTP-only
   // Traefik config (no ACME), so the install works locally with zero extra
@@ -151,6 +161,7 @@ async function buildDefaults(installDir: string): Promise<Defaults> {
     repoBaseDir: path.join(installDir, "repos"),
     enableQaBrowser: true,
     enableCodeServer: true,
+    demoMode: false,
     traefik: {
       baseDomain: "localhost",
       envRoutingBase: "localhost",
@@ -170,6 +181,10 @@ type Answers = Omit<Defaults, "traefik"> & {
     httpPort: number;
     httpsPort: number;
   } | null;
+  // Anthropic API key. Normally blank (configured later from the UI), but in
+  // demo mode the operator supplies it at install time since public visitors
+  // can't set it themselves.
+  anthropicApiKey: string;
 };
 
 export async function runInit(opts: InitOptions): Promise<void> {
@@ -335,14 +350,16 @@ export async function runInit(opts: InitOptions): Promise<void> {
   const internalJwtSecret = randomSecret(32);
   const postgresPassword = randomPassword(24);
 
-  // 8. Build .env. Note: ANTHROPIC_API_KEY / GOOGLE_* / GITHUB_TOKEN are
-  //    intentionally blank — the user configures those later from the UI.
+  // 8. Build .env. Note: GOOGLE_* / GITHUB_TOKEN are intentionally blank — the
+  //    user configures those later from the UI. ANTHROPIC_API_KEY is normally
+  //    blank too, EXCEPT in demo mode where the operator supplies it at install
+  //    (public visitors can't set their own).
   const envValues: EnvMap = {
     POSTGRES_USER: "withvibe",
     POSTGRES_PASSWORD: postgresPassword,
     POSTGRES_DB: "withvibe",
     INTERNAL_JWT_SECRET: internalJwtSecret,
-    ANTHROPIC_API_KEY: "",
+    ANTHROPIC_API_KEY: answers.anthropicApiKey,
     GOOGLE_CLIENT_ID: "",
     GOOGLE_CLIENT_SECRET: "",
     GITHUB_TOKEN: "",
@@ -359,6 +376,17 @@ export async function runInit(opts: InitOptions): Promise<void> {
     API_HOST_PORT: String(answers.apiHostPort),
     REPO_BASE_DIR: expandHome(answers.repoBaseDir),
     LOG_LEVEL: "info",
+    // Public demo mode. Driven by the install prompt (custom preset); when on,
+    // every visitor gets their own isolated workspace running one cloned
+    // vibe-aquarium env and all other env/template/repo creation is blocked
+    // server-side. Both keys move together (the second is the web UI mirror).
+    DEMO_MODE: answers.demoMode ? "true" : "",
+    NEXT_PUBLIC_DEMO_MODE: answers.demoMode ? "true" : "",
+    // Repos auto-seeded as env templates into every new workspace. In demo mode
+    // we point this at the vibe-aquarium repo so the one allowed env exists.
+    DEMO_TEMPLATE_REPOS: answers.demoMode
+      ? "https://github.com/withvibe/vibe-aquarium.git"
+      : "",
   };
   if (bundle?.version) {
     envValues.WITHVIBE_VERSION = bundle.version;
@@ -426,6 +454,13 @@ export async function runInit(opts: InitOptions): Promise<void> {
   );
   log.info(`QA browser:     ${answers.enableQaBrowser ? "enabled" : "disabled"}`);
   log.info(`code-server:    ${answers.enableCodeServer ? "enabled" : "disabled"}`);
+  if (answers.demoMode) {
+    log.info(
+      `Demo mode:      enabled (public; vibe-aquarium only, Anthropic key ${
+        answers.anthropicApiKey ? "set" : "NOT set — agents disabled"
+      })`
+    );
+  }
   // 12. Decide whether to continue into build-images + start.
   //     Default preset auto-continues (one-click is the whole point).
   //     Custom preset asks. Both honor --no-build / --no-start.
@@ -588,7 +623,7 @@ async function collectAnswers(
       log.warn(
         `Port 80 in use — Traefik HTTP bound to :${d.traefik.httpPort}.`
       );
-    return { ...d, traefik: d.traefik };
+    return { ...d, traefik: d.traefik, anthropicApiKey: "" };
   }
 
   const publicHost = await ask({
@@ -697,6 +732,32 @@ async function collectAnswers(
     initial: d.repoBaseDir,
   });
 
+  // Public demo mode. When on: every visitor gets their own isolated workspace
+  // running one cloned vibe-aquarium env, all other env/template/repo creation
+  // is blocked, and visitors can't change the Anthropic key — so the operator
+  // supplies it here (agents won't run without one).
+  const demoMode = await confirm(
+    "Enable public demo mode (locked-down: visitors only get the vibe-aquarium env)?",
+    d.demoMode
+  );
+  let anthropicApiKey = "";
+  if (demoMode) {
+    anthropicApiKey = (
+      await ask({
+        type: "password",
+        name: "v",
+        message:
+          "Anthropic API key for the demo (visitors can't set their own; leave blank to configure later):",
+        initial: "",
+      })
+    ).trim();
+    if (!anthropicApiKey) {
+      log.warn(
+        "No Anthropic key entered — agents stay disabled until you set ANTHROPIC_API_KEY in .env and restart."
+      );
+    }
+  }
+
   return {
     installDir: d.installDir,
     publicHost,
@@ -707,7 +768,9 @@ async function collectAnswers(
     repoBaseDir,
     enableQaBrowser,
     enableCodeServer,
+    demoMode,
     traefik,
+    anthropicApiKey,
   };
 }
 
