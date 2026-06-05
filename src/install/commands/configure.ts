@@ -516,7 +516,7 @@ async function configureAdvanced(installDir: string): Promise<void> {
           },
           {
             title: `Traefik container name: ${
-              env.WITHVIBE_TRAEFIK_CONTAINER || "withvibe-traefik (default)"
+              env.WITHVIBE_TRAEFIK_CONTAINER || "auto-discover (default)"
             }`,
             value: "traefik-name",
           },
@@ -654,12 +654,19 @@ async function configureTraefikContainer(installDir: string): Promise<void> {
     type: "text",
     name: "v",
     message:
-      "Traefik container name (platform connects it to each env's edge net):",
-    initial: env.WITHVIBE_TRAEFIK_CONTAINER ?? "withvibe-traefik",
+      "Traefik container name — leave blank to auto-discover (recommended; " +
+      "Compose names it with a -1 suffix). Only set for a non-standard name:",
+    initial: env.WITHVIBE_TRAEFIK_CONTAINER ?? "",
   });
-  const final = name.trim() || "withvibe-traefik";
+  const final = name.trim();
+  // Blank = let the api discover Traefik by its Compose service label. Writing
+  // an empty value keeps the compose `${...:-}` default in force.
   await mergeEnv(installDir, { WITHVIBE_TRAEFIK_CONTAINER: final });
-  log.ok(`Traefik container name set to "${final}".`);
+  log.ok(
+    final
+      ? `Traefik container name set to "${final}".`
+      : "Traefik container name set to auto-discover."
+  );
 }
 
 // Normalise a comma list the same way the api parses these allowlists:
