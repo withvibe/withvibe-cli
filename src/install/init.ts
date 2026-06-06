@@ -24,6 +24,7 @@ import { setNoPull, setTraefik, stripBuildBlocks } from "./compose-rewriter.js";
 import { findFreePort } from "./ports.js";
 import { runBuildImages } from "./commands/build-images-cmd.js";
 import { runStart } from "./commands/lifecycle.js";
+import { compose } from "./compose.js";
 
 export type InitOptions = {
   mode?: InstallMode;
@@ -258,6 +259,37 @@ export async function runInit(opts: InitOptions): Promise<void> {
         log.ok("Left the existing install untouched. Nothing changed.");
         process.exit(0);
       }
+    }
+
+    // We're committed to a destructive re-init. Tear the previous stack down
+    // WITH its volumes (`down -v`). Without this, the postgres-data volume
+    // survives the wipe and keeps the OLD password — a non-empty data dir
+    // makes Postgres ignore the freshly regenerated POSTGRES_PASSWORD — so the
+    // api then crash-loops with P1000 auth failures against the new password.
+    // Best-effort: a missing compose file or an already-stopped stack must not
+    // block the re-init.
+    log.info("Removing the previous stack and its data volumes…");
+    try {
+      const res = await compose(
+        installDir,
+        ["down", "-v", "--remove-orphans"],
+        { stream: false }
+      );
+      if (res.code === 0) {
+        log.ok("Removed previous containers and volumes.");
+      } else {
+        log.warn(
+          `compose down exited ${res.code} — continuing. If the api later ` +
+            "fails with a Postgres auth error, remove the stale volume with " +
+            "`docker volume rm withvibe_postgres-data`."
+        );
+      }
+    } catch (err) {
+      log.warn(
+        `Could not tear down the previous stack (${
+          err instanceof Error ? err.message : String(err)
+        }) — continuing. Remove stale volumes manually if Postgres auth fails.`
+      );
     }
   }
 

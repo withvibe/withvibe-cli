@@ -1,6 +1,6 @@
 {
   "name": "withvibe",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "withvibe CLI — install/manage the server stack and run shared environments locally.",
   "license": "Apache-2.0",
   "homepage": "https://withvibe.dev",
