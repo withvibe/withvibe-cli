@@ -59,11 +59,17 @@ export async function runStart(args: LifecycleArgs): Promise<void> {
 async function waitFor(label: string, url: string): Promise<void> {
   const spinner = ora(`Waiting for ${label} (${url})…`).start();
   const r = await waitForUrl(url);
-  if (r.ok) spinner.succeed(`${label} reachable (HTTP ${r.lastStatus})`);
-  else
-    spinner.fail(
-      `${label} did not become reachable: ${r.lastError ?? `HTTP ${r.lastStatus}`}`
-    );
+  if (r.ok) {
+    spinner.succeed(`${label} reachable (HTTP ${r.lastStatus})`);
+    return;
+  }
+  // The container can still be mid-bringup (e.g. Postgres first-boot) when the
+  // probe window elapses — the stack often becomes reachable a few seconds
+  // later. Don't present that as a hard failure; warn with how to check.
+  spinner.warn(
+    `${label} not reachable yet (${r.lastError ?? `HTTP ${r.lastStatus}`}) — it may still be starting.`
+  );
+  log.dim(`  Check ${url} in a minute, or run \`withvibe logs ${label}\`.`);
 }
 
 export async function runStop(args: LifecycleArgs): Promise<void> {
